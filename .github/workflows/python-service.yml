@@ -58,14 +58,17 @@ jobs:
         run: pip-audit || true   # report-only until the lockfile stabilizes
       - name: Secret scan (gitleaks)
         uses: gitleaks/gitleaks-action@v2
-        env: { GITHUB_TOKEN: "${{ github.token }}" }
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
 
   test:
     runs-on: ubuntu-latest
     services:
       postgres:
         image: postgres:16
-        env: { POSTGRES_PASSWORD: postgres, POSTGRES_DB: ${{ inputs.service }} }
+        env:
+          POSTGRES_PASSWORD: postgres
+          POSTGRES_DB: ${{ inputs.service }}
         ports: ["5432:5432"]
         options: >-
           --health-cmd pg_isready --health-interval 10s --health-timeout 5s --health-retries 5
