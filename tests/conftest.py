@@ -25,13 +25,20 @@ class FakeVerifier:
             raise AccessDenied("Invalid token")
         if token == "operator":
             return AuthContext(
-                subject=SUBJECT, email="op@crucibix.com", tenant_id=None,
-                is_platform_operator=True, privileges=frozenset({"platform.tenants:manage"}),
+                subject=SUBJECT,
+                email="op@crucibix.com",
+                tenant_id=None,
+                is_platform_operator=True,
+                privileges=frozenset({"platform.tenants:manage"}),
             )
         privileges = frozenset(p for p in token.split(",") if p)
         return AuthContext(
-            subject=SUBJECT, email="user@acme.test", tenant_id=TENANT,
-            roles=frozenset({"director"}), privileges=privileges, correlation_id=correlation_id,
+            subject=SUBJECT,
+            email="user@acme.test",
+            tenant_id=TENANT,
+            roles=frozenset({"director"}),
+            privileges=privileges,
+            correlation_id=correlation_id,
         )
 
 

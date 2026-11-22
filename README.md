@@ -20,8 +20,10 @@ from fastapi import APIRouter, Depends
 
 router = APIRouter()
 
+
 @router.get("/investors", dependencies=[Depends(require_privilege("investors:read"))])
 async def list_investors(): ...
+
 
 app = create_app(PlatformSettings(service_name="investors"), routers=[router])
 ```
