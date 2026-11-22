@@ -24,6 +24,8 @@ class PlatformSettings(BaseSettings):
     # Eventing
     event_bus_name: str = "crucibix"
     aws_region: str = "ap-south-1"
+    # Set to the LocalStack edge (e.g. http://localhost:4566) for local-dev; None → real AWS.
+    aws_endpoint_url: str | None = None
 
     # Observability
     otel_exporter_otlp_endpoint: str | None = None
