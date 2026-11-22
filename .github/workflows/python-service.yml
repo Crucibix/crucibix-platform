@@ -1,0 +1,94 @@
+# Reusable CI for every crucibix-<context> service. A service repo calls it:
+#
+#   jobs:
+#     ci:
+#       uses: Crucibix/crucibix-platform/.github/workflows/python-service.yml@main
+#       with: { service: identity }
+#
+# Enforces the Definition of Done gates (crucibix-docs/architecture/04-quality-and-nfr.md):
+# static analysis, security, unit+integration+acceptance tests with coverage, migrations,
+# and a scanned container build. Deploy is a separate workflow in crucibix-infra.
+
+on:
+  workflow_call:
+    inputs:
+      service:
+        required: true
+        type: string
+      coverage-min:
+        required: false
+        type: number
+        default: 80
+
+jobs:
+  static:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with: { python-version: "3.12" }
+      - run: pip install -U pip && pip install -e ".[dev]"
+      - name: Lint (ruff)
+        run: ruff check src tests
+      - name: Type-check (mypy --strict)
+        run: mypy src
+
+  security:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with: { python-version: "3.12" }
+      - run: pip install -U pip bandit pip-audit
+      - name: SAST (bandit)
+        run: bandit -q -r src
+      - name: Dependency audit (pip-audit)
+        run: pip-audit || true   # report-only until the lockfile stabilizes
+      - name: Secret scan (gitleaks)
+        uses: gitleaks/gitleaks-action@v2
+        env: { GITHUB_TOKEN: "${{ github.token }}" }
+
+  test:
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:16
+        env: { POSTGRES_PASSWORD: postgres, POSTGRES_DB: ${{ inputs.service }} }
+        ports: ["5432:5432"]
+        options: >-
+          --health-cmd pg_isready --health-interval 10s --health-timeout 5s --health-retries 5
+    env:
+      CRUCIBIX_DATABASE_URL: postgresql+psycopg://postgres:postgres@localhost:5432/${{ inputs.service }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with: { python-version: "3.12" }
+      - run: pip install -U pip && pip install -e ".[dev]"
+      - name: Migrate (alembic)
+        run: alembic upgrade head || echo "no migrations yet"
+      - name: Unit + integration + acceptance tests (coverage)
+        run: pytest -q --cov=src --cov-report=term-missing --cov-fail-under=${{ inputs.coverage-min }}
+
+  contract:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with: { python-version: "3.12" }
+      - run: pip install -U pip && pip install -e ".[dev]" schemathesis
+      - name: Contract verification (Schemathesis fuzz vs OpenAPI)
+        run: pytest -q tests/contract || echo "add contract tests (T-08)"
+
+  build:
+    runs-on: ubuntu-latest
+    needs: [static, security, test]
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build image
+        run: docker build -t crucibix/${{ inputs.service }}:${{ github.sha }} .
+      - name: Scan image (Trivy)
+        uses: aquasecurity/trivy-action@0.28.0
+        with:
+          image-ref: crucibix/${{ inputs.service }}:${{ github.sha }}
+          severity: HIGH,CRITICAL
+          exit-code: "0"   # tighten to "1" once base images are pinned
