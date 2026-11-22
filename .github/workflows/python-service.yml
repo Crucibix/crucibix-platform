@@ -4,16 +4,13 @@
 #     ci:
 #       uses: Crucibix/crucibix-platform/.github/workflows/python-service.yml@main
 #       with: { service: identity }
-#       secrets: inherit          # passes CRUCIBIX_PLATFORM_READ_TOKEN through (private dep)
 #
 # Enforces the Definition of Done gates (crucibix-docs/architecture/04-quality-and-nfr.md):
 # static analysis, security, unit+integration+acceptance tests with coverage, migrations,
 # and a scanned container build. Deploy is a separate workflow in crucibix-infra.
 #
-# The services depend on `crucibix-platform` from its private git repo. CI authenticates that
-# install with the org secret CRUCIBIX_PLATFORM_READ_TOKEN (a read-only, Contents:read-only PAT),
-# injected via `git config insteadOf` for pip and via a BuildKit secret for docker build so the
-# token never lands in a git config the image keeps or in an image layer.
+# The services depend on `crucibix-platform`, which is a PUBLIC repo, so the git+https pip
+# install clones it anonymously — no token, no secret, nothing to leak or rotate.
 
 on:
   workflow_call:
@@ -25,10 +22,6 @@ on:
         required: false
         type: number
         default: 80
-    secrets:
-      CRUCIBIX_PLATFORM_READ_TOKEN:
-        required: false
-        description: Read-only PAT to install the private crucibix-platform dependency.
 
 jobs:
   static:
@@ -37,13 +30,6 @@ jobs:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
         with: { python-version: "3.12" }
-      - name: Auth private platform dep
-        run: |
-          if [ -z "${{ secrets.CRUCIBIX_PLATFORM_READ_TOKEN }}" ]; then
-            echo "::error::CRUCIBIX_PLATFORM_READ_TOKEN is empty — the org secret is not reaching this run. Check the secret's exact name, that its repository access includes this repo (All or Private repositories), and that the caller passes 'secrets: inherit'."
-            exit 1
-          fi
-          git config --global url."https://x-access-token:${{ secrets.CRUCIBIX_PLATFORM_READ_TOKEN }}@github.com/".insteadOf "https://github.com/"
       - run: pip install -U pip && pip install -e ".[dev]"
       - name: Lint (ruff)
         run: ruff check src tests
@@ -83,13 +69,6 @@ jobs:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
         with: { python-version: "3.12" }
-      - name: Auth private platform dep
-        run: |
-          if [ -z "${{ secrets.CRUCIBIX_PLATFORM_READ_TOKEN }}" ]; then
-            echo "::error::CRUCIBIX_PLATFORM_READ_TOKEN is empty — the org secret is not reaching this run. Check the secret's exact name, that its repository access includes this repo (All or Private repositories), and that the caller passes 'secrets: inherit'."
-            exit 1
-          fi
-          git config --global url."https://x-access-token:${{ secrets.CRUCIBIX_PLATFORM_READ_TOKEN }}@github.com/".insteadOf "https://github.com/"
       - run: pip install -U pip && pip install -e ".[dev]"
       - name: Migrate (alembic)
         run: alembic upgrade head || echo "no migrations yet"
@@ -102,13 +81,6 @@ jobs:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
         with: { python-version: "3.12" }
-      - name: Auth private platform dep
-        run: |
-          if [ -z "${{ secrets.CRUCIBIX_PLATFORM_READ_TOKEN }}" ]; then
-            echo "::error::CRUCIBIX_PLATFORM_READ_TOKEN is empty — the org secret is not reaching this run. Check the secret's exact name, that its repository access includes this repo (All or Private repositories), and that the caller passes 'secrets: inherit'."
-            exit 1
-          fi
-          git config --global url."https://x-access-token:${{ secrets.CRUCIBIX_PLATFORM_READ_TOKEN }}@github.com/".insteadOf "https://github.com/"
       - run: pip install -U pip && pip install -e ".[dev]" schemathesis
       - name: Contract verification (Schemathesis fuzz vs OpenAPI)
         run: pytest -q tests/contract || echo "add contract tests (T-08)"
@@ -118,17 +90,8 @@ jobs:
     needs: [static, security, test]
     steps:
       - uses: actions/checkout@v4
-      - name: Build image (BuildKit secret feeds the private-dep token, kept out of layers)
-        run: |
-          if [ -z "${{ secrets.CRUCIBIX_PLATFORM_READ_TOKEN }}" ]; then
-            echo "::error::CRUCIBIX_PLATFORM_READ_TOKEN is empty (see the note in the static job)."
-            exit 1
-          fi
-          echo "${{ secrets.CRUCIBIX_PLATFORM_READ_TOKEN }}" > "$RUNNER_TEMP/platform_token"
-          DOCKER_BUILDKIT=1 docker build \
-            --secret id=platform_token,src="$RUNNER_TEMP/platform_token" \
-            -t crucibix/${{ inputs.service }}:${{ github.sha }} .
-          rm -f "$RUNNER_TEMP/platform_token"
+      - name: Build image
+        run: docker build -t crucibix/${{ inputs.service }}:${{ github.sha }} .
       - name: Scan image (Trivy)
         uses: aquasecurity/trivy-action@0.28.0
         with:
