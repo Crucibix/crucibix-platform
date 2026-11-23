@@ -11,6 +11,7 @@ the cross-cutting machinery so each `crucibix-<context>` service focuses on its 
 | **Domain** | `AggregateRoot` / `Entity` / `ValueObject` / `DomainEvent` base classes + a domain error hierarchy |
 | **Events** | the shared event envelope (matches the AsyncAPI contract), `EventPublisher` port + transactional **outbox** + `ProcessedEvent` idempotency ledger |
 | **Observability** | structlog JSON logging + optional OpenTelemetry wiring |
+| **PII encryption** | per-org envelope encryption (`crucibix_platform.security.pii`): a KMS-wrapped data key, an `EnvelopeCipher` with key rotation, and an `EncryptedType` SQLAlchemy column for PII fields |
 
 ## Use it in a service
 
@@ -106,6 +107,47 @@ def test_every_tenant_table_is_covered():
 The UoW factory is whatever you already have: a callable mapping a tenant id (or `None` for the
 unscoped consumer) to a context-managed unit of work. Every entry in `allow` is a conscious waiver —
 keep a comment saying why the organization is not an isolation boundary for that table.
+
+## PII field encryption (per-org)
+
+Sensitive columns — `investor_pii`, `employee_pii`, `salary`, `patient_pii` — must be encrypted at
+rest under a **per-org** key (compliance gate, gap #15). `crucibix_platform.security.pii` provides
+the shared kernel; the identity-access *org keyring API* (DEK storage + rotation endpoint) wires it
+to a key store separately.
+
+It is textbook **envelope encryption**. A per-org 256-bit **DEK** encrypts field values with
+AES-256-GCM (random nonce per value, org id + key version bound as associated data). The DEK is
+itself wrapped by a **KEK** through a `KmsPort` — `LocalKms` (a config master key, for dev/compose)
+or `AwsKms` (AWS KMS; the KEK never leaves KMS). Only the *wrapped* DEK is ever persisted, and the
+decrypt path uses a cached unwrapped DEK, so there is **no KMS/network hop per value**. Any tamper,
+wrong key, wrong org, or malformed envelope **raises** `PiiDecryptionError` — plaintext is never
+returned on failure. Rotation mints a new DEK version (current for new writes) while old versions
+keep decrypting until each value is re-encrypted.
+
+The org context reaches the SQLAlchemy column type through a context var (same pattern as the request
+tenant), bound per unit of work:
+
+```python
+from crucibix_platform.security.pii import (
+    EncryptedType, EnvelopeCipher, OrgKeyring, build_kms, pii_encryption,
+)
+
+class Employee(Base, TenantScopedMixin):
+    __tablename__ = "employees"
+    employee_pii: Mapped[str] = mapped_column(EncryptedType())
+    salary: Mapped[int] = mapped_column(EncryptedType(serializer=str, deserializer=int))
+
+kms = build_kms(settings)                                        # LocalKms (dev) | AwsKms (prod)
+cipher = EnvelopeCipher(OrgKeyring.load(org_id, kms, versions, current))  # versions from the key store
+with pii_encryption(cipher):                                     # bind once per request/UoW
+    session.add(Employee(organization_id=org_id, employee_pii="…", salary=90_000))
+    session.commit()                                             # both columns encrypted with THIS org's DEK
+```
+
+`OrgKeyring.create(org_id, kms)` mints a brand-new keyring (first-time onboarding);
+`cipher.rotate(values)` mints the next DEK version and re-encrypts the values you pass. Configure the
+KEK with the `CRUCIBIX_PII_*` settings (`PiiEncryptionSettings`): `pii_kms_mode` (`local`/`aws`),
+`pii_master_key` (base64, local mode — required outside dev), `pii_kms_key_id` (aws mode).
 
 ## Develop
 
