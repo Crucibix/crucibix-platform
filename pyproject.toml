@@ -12,6 +12,11 @@ dependencies = [
     "pydantic>=2.9,<3.0",
     "pydantic-settings>=2.5,<3.0",
     "SQLAlchemy>=2.0,<2.1",
+    # The Postgres driver is part of the standard service DB stack: every deployable connects via
+    # `postgresql+psycopg://`, so the driver must be a RUNTIME dep, not a test-only one. Shipping it
+    # here guarantees no service image (current or future, even if its own pyproject misfiles it)
+    # boots without a driver. `[binary]` ships the prebuilt libpq wheel — no build toolchain needed.
+    "psycopg[binary]>=3.2",
     "PyJWT[crypto]>=2.9,<3.0",
     "httpx>=0.27,<1.0",
     "structlog>=24.4",
