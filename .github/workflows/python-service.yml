@@ -132,10 +132,10 @@ on:
         type: boolean
         default: false
     secrets:
-      contracts-token:
+      contracts_token:
         description: "PAT with read access to a PRIVATE crucibix-contracts. Omit if contracts is public (anonymous clone)."
         required: false
-      dast-bearer-token:
+      dast_bearer_token:
         description: "Bearer token for the authenticated DAST scan. Omit → ZAP runs unauthenticated."
         required: false
 
@@ -300,7 +300,7 @@ jobs:
         with:
           repository: ${{ inputs.contracts-repo }}
           path: _contracts
-          token: ${{ secrets.contracts-token || github.token }}
+          token: ${{ secrets.contracts_token || github.token }}
       - name: Provider verification (Schemathesis + Pact)
         env:
           STRICT: ${{ inputs.strict-contract }}
@@ -397,7 +397,7 @@ jobs:
         env:
           STRICT: ${{ inputs.strict-dast }}
           MODE: ${{ inputs.mode }}
-          BEARER: ${{ secrets.dast-bearer-token }}
+          BEARER: ${{ secrets.dast_bearer_token }}
         run: |
           set -e
           alembic upgrade head || echo "no migrations yet"
