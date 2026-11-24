@@ -491,3 +491,14 @@ jobs:
           fi
           mutmut run --paths-to-mutate "${{ inputs.domain-path }}" || true
           mutmut results || true
+
+  # ─── Required-status aggregator ──────────────────────────────────────────────
+  # ONE check for branch protection / the coordinator's merge gate to key off, so
+  # the required set never changes as report-only ramp jobs (codeql, contract,
+  # perf, dast, mutation) are promoted. To promote a ramp job to a hard gate, add
+  # it to `needs:` here — nothing else to touch. Appears to callers as `ci / ci-green`.
+  ci-green:
+    runs-on: ubuntu-latest
+    needs: [static, security, test, build]
+    steps:
+      - run: echo "all required gates passed"
