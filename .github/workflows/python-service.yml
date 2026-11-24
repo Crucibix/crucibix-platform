@@ -204,7 +204,12 @@ jobs:
           gitleaks dir . --redact --no-banner --exit-code 1
 
   # 2b. CodeQL (SAST, semantic). Reports to the Security tab; does not block on findings. ─────────
+  # Code scanning needs GitHub Advanced Security, which is unavailable on private repos on the Free
+  # plan — there the upload 403s and the job always fails (report-only, not in ci-green's needs, so
+  # it never blocks a merge, but it does paint every private-repo run red). Gate it to public repos
+  # (crucibix-platform) where GHAS exists; private service repos simply skip it.
   codeql:
+    if: ${{ github.event.repository.visibility == 'public' }}
     runs-on: ubuntu-latest
     permissions:
       actions: read
