@@ -5,59 +5,278 @@
 #       uses: Crucibix/crucibix-platform/.github/workflows/python-service.yml@main
 #       with: { service: identity }
 #
-# Enforces the Definition of Done gates (crucibix-docs/architecture/04-quality-and-nfr.md):
-# static analysis, security, unit+integration+acceptance tests with coverage, migrations,
-# and a scanned container build. Deploy is a separate workflow in crucibix-infra.
+# Implements the backend service pipeline in crucibix-docs/architecture/03-infrastructure-and-devops.md
+# (§"Backend service pipeline") and the Definition of Done in 04-quality-and-nfr.md:
+#   static → security (SAST+CodeQL+deps+secrets+IaC) → unit/integration (Postgres + LocalStack)
+#   → contract (Schemathesis + Pact) → acceptance/tenant-isolation/authz (pytest-bdd)
+#   → perf (k6) → DAST (OWASP ZAP) → container build+scan → ECR push (immutable sha)
+#   → mutation (nightly). Deploy is a separate workflow in crucibix-infra.
 #
-# The services depend on `crucibix-platform`, which is a PUBLIC repo, so the git+https pip
-# install clones it anonymously — no token, no secret, nothing to leak or rotate.
+# ─────────────────────────────────────────────────────────────────────────────────────────────
+# THE RAMP — why every NEW stage is non-blocking by default
+# ─────────────────────────────────────────────────────────────────────────────────────────────
+# All 18 services call THIS one workflow @main, so a hard gate on tests that don't exist yet would
+# turn the whole fleet red the moment they re-pin. Every stage added here is therefore soft until a
+# service opts in, by one of two mechanisms:
+#
+#   1. skip-if-absent — contract/perf/DAST/domain-coverage auto-skip (green) until the service grows
+#      the inputs (an OpenAPI in crucibix-contracts, a tests/perf/*.js script, a tests/contract suite,
+#      a `domain-path`). Once present, the stage runs for real.
+#   2. strict-* toggles — a stage that CAN run but whose findings you're not ready to block on stays
+#      report-only until the service flips the toggle. Defaults: ALL false (report-only).
+#
+# How a service HARDENS (opt into strict gating), incrementally, in its own caller `with:`:
+#       with:
+#         service: identity
+#         domain-path: src/crucibix_identity/domain   # enables the ≥90% domain-core coverage gate
+#         strict-security: true   # pip-audit + Semgrep + Trivy HIGH/CRITICAL → exit 1
+#         strict-contract: true   # Schemathesis/Pact provider verification → blocking
+#         strict-perf:     true   # k6 p95 latency budgets → blocking
+#         strict-dast:     true   # OWASP ZAP alerts → blocking
+#
+# How a service runs the NIGHTLY heavy path (full k6 load, ZAP full scan, mutation). Reusable
+# workflows can't declare `schedule` themselves, so the CALLER adds the trigger and passes mode:full:
+#       # .github/workflows/ci.yml in the service repo
+#       on:
+#         pull_request:
+#         push: { branches: [main] }
+#         schedule: [{ cron: "0 3 * * *" }]   # nightly
+#       jobs:
+#         ci:
+#           uses: Crucibix/crucibix-platform/.github/workflows/python-service.yml@main
+#           with:
+#             service: identity
+#             mode: ${{ github.event_name == 'schedule' && 'full' || 'pr' }}
+#           secrets: inherit   # only needed for private crucibix-contracts / DAST bearer token
+#
+# ECR push: happens only on push to main AND only when the caller repo defines the repo/org
+# variable `vars.AWS_OIDC_ROLE_ARN` (assumed via GitHub OIDC — zero static AWS keys). Absent → skipped.
+#
+# The services depend on `crucibix-platform`, which is a PUBLIC repo, so the git+https pip install
+# clones it anonymously — no token, no secret, nothing to leak or rotate. Cross-repo checkouts that
+# DO need auth (private crucibix-contracts) are `continue-on-error` and degrade to skip-if-absent, so
+# a public/anonymous clone of a service still gets a green run without any secret.
 
 on:
   workflow_call:
     inputs:
       service:
+        description: "Context name, e.g. identity / orders-checkout. Used for the DB name and the ECR repo."
         required: true
         type: string
+      mode:
+        description: "'pr' (fast subset, default) or 'full' (nightly heavy: full k6 load, ZAP full scan, mutation)."
+        required: false
+        type: string
+        default: pr
       coverage-min:
+        description: "Service-overall coverage floor (doc-04 DoD: ≥80)."
         required: false
         type: number
         default: 80
+      domain-core-coverage-min:
+        description: "Domain-core coverage floor (doc-04 DoD: ≥90). Enforced only when domain-path is set."
+        required: false
+        type: number
+        default: 90
+      domain-path:
+        description: "Path to the domain core (e.g. src/crucibix_identity/domain). Empty → domain gate skipped (ramp)."
+        required: false
+        type: string
+        default: ""
+      python-version:
+        required: false
+        type: string
+        default: "3.12"
+      app-module:
+        description: "ASGI app import path for the booted service (contract/perf/DAST jobs)."
+        required: false
+        type: string
+        default: "app.main:app"
+      app-port:
+        required: false
+        type: number
+        default: 8000
+      health-path:
+        description: "Liveness path polled before fuzzing/scanning the booted service."
+        required: false
+        type: string
+        default: "/healthz"
+      contract-service:
+        description: "Dir name under crucibix-contracts if it differs from `service`. Empty → use `service`."
+        required: false
+        type: string
+        default: ""
+      contracts-repo:
+        required: false
+        type: string
+        default: "Crucibix/crucibix-contracts"
+      strict-security:
+        description: "false (default, report-only) → true: pip-audit + Semgrep + Trivy HIGH/CRITICAL fail the build."
+        required: false
+        type: boolean
+        default: false
+      strict-contract:
+        description: "false (default, report-only) → true: Schemathesis/Pact provider verification blocks."
+        required: false
+        type: boolean
+        default: false
+      strict-perf:
+        description: "false (default, report-only) → true: k6 p95 latency thresholds block."
+        required: false
+        type: boolean
+        default: false
+      strict-dast:
+        description: "false (default, report-only) → true: OWASP ZAP alerts block."
+        required: false
+        type: boolean
+        default: false
+    secrets:
+      contracts-token:
+        description: "PAT with read access to a PRIVATE crucibix-contracts. Omit if contracts is public (anonymous clone)."
+        required: false
+      dast-bearer-token:
+        description: "Bearer token for the authenticated DAST scan. Omit → ZAP runs unauthenticated."
+        required: false
 
 jobs:
+  # 1. Static: lint, type-check, complexity. ─────────────────────────────────────────────────────
   static:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v5
       - uses: actions/setup-python@v6
-        with: { python-version: "3.12" }
+        with: { python-version: "${{ inputs.python-version }}" }
       - run: pip install -U pip && pip install -e ".[dev]"
       - name: Lint (ruff)
         run: ruff check src tests
       - name: Type-check (mypy --strict)
         run: mypy src
 
+  # 2. Security: SAST (Bandit + Semgrep), dependency audit, secret scan, IaC scan. ───────────────
   security:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v5
       - uses: actions/setup-python@v6
-        with: { python-version: "3.12" }
-      - run: pip install -U pip bandit pip-audit
+        with: { python-version: "${{ inputs.python-version }}" }
+      - run: pip install -U pip bandit pip-audit semgrep
       - name: SAST (bandit)
         run: bandit -q -r src
+      - name: SAST (semgrep)
+        # Semgrep's curated rulesets. Report-only until `strict-security`, so adopting the stage
+        # never reddens a service that has pre-existing findings to burn down first.
+        run: |
+          if [ "${{ inputs.strict-security }}" = "true" ]; then
+            semgrep scan --config auto --error --quiet src
+          else
+            semgrep scan --config auto --quiet src || echo "::warning::semgrep findings (report-only; set strict-security:true to gate)"
+          fi
       - name: Dependency audit (pip-audit)
-        run: pip-audit || true   # report-only until the lockfile stabilizes
+        run: |
+          if [ "${{ inputs.strict-security }}" = "true" ]; then
+            pip-audit
+          else
+            pip-audit || echo "::warning::pip-audit findings (report-only; set strict-security:true to gate)"
+          fi
+      - name: IaC scan (checkov) — skip if no IaC
+        # Service repos rarely carry Terraform (that lives in crucibix-infra), so skip-if-absent.
+        run: |
+          if compgen -G "*.tf" >/dev/null || [ -d terraform ] || [ -d infra ]; then
+            pip install checkov
+            if [ "${{ inputs.strict-security }}" = "true" ]; then
+              checkov -d . --quiet --compact
+            else
+              checkov -d . --quiet --compact --soft-fail
+            fi
+          else
+            echo "no IaC in this repo — skipping (ramp)"
+          fi
       - name: Secret scan (gitleaks)
         # Use the free, open-source gitleaks CLI directly. The gitleaks-action@v2 wrapper
         # requires a paid license for organization repos; the scanner binary does not, so
-        # this keeps full secret-scanning coverage at no cost. Fails the job on any finding.
+        # this keeps full secret-scanning coverage at no cost. Fails the job on any finding
+        # (secret leaks are never ramped — always blocking).
         run: |
           VER=8.21.2
           curl -sSL "https://github.com/gitleaks/gitleaks/releases/download/v${VER}/gitleaks_${VER}_linux_x64.tar.gz" \
             | tar -xz -C /usr/local/bin gitleaks
           gitleaks dir . --redact --no-banner --exit-code 1
 
+  # 2b. CodeQL (SAST, semantic). Reports to the Security tab; does not block on findings. ─────────
+  codeql:
+    runs-on: ubuntu-latest
+    permissions:
+      actions: read
+      contents: read
+      security-events: write
+    steps:
+      - uses: actions/checkout@v5
+      - uses: github/codeql-action/init@v3
+        with: { languages: python }
+      - uses: github/codeql-action/analyze@v3
+        with: { category: "/language:python" }
+
+  # 3 + 4 + 5 + 6. Unit + Integration (Postgres + LocalStack) + Acceptance/Isolation/Authz. ──────
   test:
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_PASSWORD: postgres
+          POSTGRES_DB: ${{ inputs.service }}
+        ports: ["5432:5432"]
+        options: >-
+          --health-cmd pg_isready --health-interval 10s --health-timeout 5s --health-retries 5
+      # Real AWS surfaces for adapter/outbox/consumer integration tests (doc-04 tier 3):
+      # SQS + EventBridge (events) + S3, all local, no cloud creds.
+      localstack:
+        image: localstack/localstack:3
+        env:
+          SERVICES: sqs,events,s3
+          DEBUG: "0"
+        ports: ["4566:4566"]
+    env:
+      CRUCIBIX_DATABASE_URL: postgresql+psycopg://postgres:postgres@localhost:5432/${{ inputs.service }}
+      # AWS SDK (boto3) + crucibix adapters point at LocalStack. Dummy creds; region required by SigV4.
+      AWS_ENDPOINT_URL: http://localhost:4566
+      CRUCIBIX_AWS_ENDPOINT_URL: http://localhost:4566
+      AWS_DEFAULT_REGION: us-east-1
+      AWS_REGION: us-east-1
+      AWS_ACCESS_KEY_ID: test
+      AWS_SECRET_ACCESS_KEY: test
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-python@v6
+        with: { python-version: "${{ inputs.python-version }}" }
+      - run: pip install -U pip && pip install -e ".[dev]" pytest-cov pytest-bdd
+      - name: Wait for LocalStack
+        run: |
+          for _ in $(seq 1 30); do
+            if curl -sf http://localhost:4566/_localstack/health >/dev/null; then echo "localstack ready"; exit 0; fi
+            sleep 2
+          done
+          echo "::error::LocalStack did not become healthy"; exit 1
+      - name: Migrate (alembic)
+        run: alembic upgrade head || echo "no migrations yet"
+      - name: Tests — unit + integration + acceptance/BDD + tenant-isolation + authz (coverage)
+        # testpaths=["tests"] (pyproject) discovers tests/acceptance (pytest-bdd), tests/isolation
+        # (tenant-isolation) and authz suites in one run. Coverage DB is written for the split gates.
+        run: pytest -q --cov=src --cov-report=term-missing --cov-report=xml
+      - name: Coverage gate — service overall (doc-04 DoD ≥ ${{ inputs.coverage-min }}%)
+        run: coverage report --fail-under=${{ inputs.coverage-min }}
+      - name: Coverage gate — domain core (doc-04 DoD ≥ ${{ inputs.domain-core-coverage-min }}%)
+        # Skip-if-absent: only enforced once the caller sets `domain-path` (ramp).
+        run: |
+          if [ -n "${{ inputs.domain-path }}" ]; then
+            coverage report --include="${{ inputs.domain-path }}/*" --fail-under=${{ inputs.domain-core-coverage-min }}
+          else
+            echo "domain-path not set — domain-core gate skipped (set domain-path to enable, ramp)"
+          fi
+
+  # 5. Contract: provider verification vs crucibix-contracts (Schemathesis fuzz + Pact hook). ─────
+  contract:
     runs-on: ubuntu-latest
     services:
       postgres:
@@ -73,26 +292,155 @@ jobs:
     steps:
       - uses: actions/checkout@v5
       - uses: actions/setup-python@v6
-        with: { python-version: "3.12" }
-      - run: pip install -U pip && pip install -e ".[dev]"
-      - name: Migrate (alembic)
-        run: alembic upgrade head || echo "no migrations yet"
-      - name: Unit + integration + acceptance tests (coverage)
-        run: pytest -q --cov=src --cov-report=term-missing --cov-fail-under=${{ inputs.coverage-min }}
+        with: { python-version: "${{ inputs.python-version }}" }
+      - run: pip install -U pip && pip install -e ".[dev]" schemathesis
+      - name: Fetch OpenAPI from crucibix-contracts (optional — continues if private/absent)
+        continue-on-error: true
+        uses: actions/checkout@v5
+        with:
+          repository: ${{ inputs.contracts-repo }}
+          path: _contracts
+          token: ${{ secrets.contracts-token || github.token }}
+      - name: Provider verification (Schemathesis + Pact)
+        env:
+          STRICT: ${{ inputs.strict-contract }}
+        run: |
+          set -e
+          NAME="${{ inputs.contract-service }}"; [ -z "$NAME" ] && NAME="${{ inputs.service }}"
+          SPEC="_contracts/${NAME}/openapi.yaml"
+          if [ ! -f "$SPEC" ]; then
+            echo "no contract spec at $SPEC — skipping contract verification (ramp: add it to ${{ inputs.contracts-repo }})"
+            exit 0
+          fi
+          alembic upgrade head || echo "no migrations yet"
+          # Boot the real app and fuzz its live implementation against the frozen OpenAPI.
+          python -m uvicorn ${{ inputs.app-module }} --host 0.0.0.0 --port ${{ inputs.app-port }} &
+          APP_PID=$!
+          for _ in $(seq 1 30); do
+            if curl -sf "http://localhost:${{ inputs.app-port }}${{ inputs.health-path }}" >/dev/null; then break; fi
+            sleep 2
+          done
+          run_or_warn() {
+            if [ "$STRICT" = "true" ]; then "$@"; else "$@" || echo "::warning::contract findings (report-only; set strict-contract:true to gate)"; fi
+          }
+          run_or_warn schemathesis run "$SPEC" --base-url "http://localhost:${{ inputs.app-port }}" --checks all --hypothesis-max-examples 50
+          # Pact provider-verification hook: a service drops a pytest suite at tests/contract that
+          # verifies recorded consumer pacts. Skip-if-absent keeps services without pacts green.
+          if [ -d tests/contract ]; then
+            run_or_warn pytest -q tests/contract
+          else
+            echo "no tests/contract (Pact) suite — skipping Pact verification (ramp)"
+          fi
+          kill $APP_PID 2>/dev/null || true
 
-  contract:
+  # 11. Performance: k6 smoke (PR) / full load (nightly). Boots service + pg via docker compose. ──
+  perf:
     runs-on: ubuntu-latest
+    needs: [static, test]
+    steps:
+      - uses: actions/checkout@v5
+      - name: k6 latency budget (p95 read <300ms / write <600ms — doc-04 NFR)
+        env:
+          STRICT: ${{ inputs.strict-perf }}
+          MODE: ${{ inputs.mode }}
+        run: |
+          set -e
+          SCRIPT=$(find tests/perf -maxdepth 1 -name '*.js' 2>/dev/null | head -1 || true)
+          if [ -z "$SCRIPT" ]; then
+            echo "no tests/perf/*.js k6 script — skipping perf (ramp: add one with thresholds)"
+            exit 0
+          fi
+          # Bring up the service + its DB. The service repo provides docker-compose.ci.yml exposing
+          # the app on :${{ inputs.app-port }}; fall back to skip if it has none yet.
+          COMPOSE="docker-compose.ci.yml"; [ -f "$COMPOSE" ] || COMPOSE="docker-compose.yml"
+          if [ ! -f "$COMPOSE" ]; then
+            echo "no compose file to boot the service — skipping perf (ramp)"
+            exit 0
+          fi
+          docker compose -f "$COMPOSE" up -d --build
+          for _ in $(seq 1 40); do
+            if curl -sf "http://localhost:${{ inputs.app-port }}${{ inputs.health-path }}" >/dev/null; then break; fi
+            sleep 3
+          done
+          # Nightly runs the full load profile; PRs run the smoke profile. k6 thresholds (in the
+          # script) make it exit non-zero when a p95 budget is breached.
+          k6=(docker run --rm --network host -e "MODE=$MODE" -e "BASE_URL=http://localhost:${{ inputs.app-port }}" \
+              -v "$PWD:/work" -w /work grafana/k6:latest run "$SCRIPT")
+          if [ "$STRICT" = "true" ]; then
+            "${k6[@]}"
+          else
+            "${k6[@]}" || echo "::warning::k6 budget breach (report-only; set strict-perf:true to gate)"
+          fi
+          docker compose -f "$COMPOSE" down -v || true
+
+  # 12. DAST: OWASP ZAP baseline (PR) / full scan (nightly), authenticated when a token is given. ─
+  dast:
+    runs-on: ubuntu-latest
+    needs: [static, test]
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_PASSWORD: postgres
+          POSTGRES_DB: ${{ inputs.service }}
+        ports: ["5432:5432"]
+        options: >-
+          --health-cmd pg_isready --health-interval 10s --health-timeout 5s --health-retries 5
+    env:
+      CRUCIBIX_DATABASE_URL: postgresql+psycopg://postgres:postgres@localhost:5432/${{ inputs.service }}
     steps:
       - uses: actions/checkout@v5
       - uses: actions/setup-python@v6
-        with: { python-version: "3.12" }
-      - run: pip install -U pip && pip install -e ".[dev]" schemathesis
-      - name: Contract verification (Schemathesis fuzz vs OpenAPI)
-        run: pytest -q tests/contract || echo "add contract tests (T-08)"
+        with: { python-version: "${{ inputs.python-version }}" }
+      - run: pip install -U pip && pip install -e ".[dev]"
+      - name: OWASP ZAP scan against the running service
+        env:
+          STRICT: ${{ inputs.strict-dast }}
+          MODE: ${{ inputs.mode }}
+          BEARER: ${{ secrets.dast-bearer-token }}
+        run: |
+          set -e
+          alembic upgrade head || echo "no migrations yet"
+          python -m uvicorn ${{ inputs.app-module }} --host 0.0.0.0 --port ${{ inputs.app-port }} &
+          APP_PID=$!
+          UP=0
+          for _ in $(seq 1 30); do
+            if curl -sf "http://localhost:${{ inputs.app-port }}${{ inputs.health-path }}" >/dev/null; then UP=1; break; fi
+            sleep 2
+          done
+          if [ "$UP" != "1" ]; then
+            echo "service did not boot (likely no app module yet) — skipping DAST (ramp)"
+            kill "$APP_PID" 2>/dev/null || true; exit 0
+          fi
+          # Baseline on PRs, full active scan nightly. Authenticated when dast-bearer-token is set.
+          ZAP_SCRIPT="zap-baseline.py"; [ "$MODE" = "full" ] && ZAP_SCRIPT="zap-full-scan.py"
+          zap=(docker run --rm --network host -v "$PWD:/zap/wrk:rw" ghcr.io/zaproxy/zaproxy:stable
+               "$ZAP_SCRIPT" -t "http://localhost:${{ inputs.app-port }}/openapi.json" -m 2 -I)
+          if [ -n "$BEARER" ]; then
+            zap+=(-config "replacer.full_list(0).description=auth"
+                  -config "replacer.full_list(0).enabled=true"
+                  -config "replacer.full_list(0).matchtype=REQ_HEADER"
+                  -config "replacer.full_list(0).matchstr=Authorization"
+                  -config "replacer.full_list(0).replacement=Bearer ${BEARER}")
+          fi
+          set +e
+          "${zap[@]}"
+          RC=$?
+          set -e
+          kill "$APP_PID" 2>/dev/null || true
+          if [ "$STRICT" = "true" ] && [ "$RC" -ne 0 ]; then
+            echo "::error::ZAP reported alerts"; exit "$RC"
+          elif [ "$RC" -ne 0 ]; then
+            echo "::warning::ZAP reported alerts (report-only; set strict-dast:true to gate)"
+          fi
 
+  # 8. Build: container image → Trivy scan → push ECR (immutable tag = git sha, OIDC, on main). ──
   build:
     runs-on: ubuntu-latest
     needs: [static, security, test]
+    permissions:
+      id-token: write   # AWS OIDC — no static keys
+      contents: read
     steps:
       - uses: actions/checkout@v5
       - name: Build image
@@ -102,4 +450,44 @@ jobs:
         with:
           image-ref: crucibix/${{ inputs.service }}:${{ github.sha }}
           severity: HIGH,CRITICAL
-          exit-code: "0"   # tighten to "1" once base images are pinned
+          # Ramp: exit 0 (report-only) by default; strict-security flips the HIGH/CRITICAL gate to exit 1.
+          exit-code: ${{ inputs.strict-security && '1' || '0' }}
+      - name: Configure AWS credentials (OIDC)
+        # Push only on a real push to main, and only when the caller repo defines the role var.
+        # Absent var (e.g. an anonymous fork or a service not yet wired to ECR) → push is skipped.
+        if: github.event_name == 'push' && github.ref == 'refs/heads/main' && vars.AWS_OIDC_ROLE_ARN != ''
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ vars.AWS_OIDC_ROLE_ARN }}
+          aws-region: ${{ vars.AWS_REGION || 'us-east-1' }}
+      - name: Login to ECR
+        if: github.event_name == 'push' && github.ref == 'refs/heads/main' && vars.AWS_OIDC_ROLE_ARN != ''
+        id: ecr
+        uses: aws-actions/amazon-ecr-login@v2
+      - name: Push immutable image (tag = git sha)
+        if: github.event_name == 'push' && github.ref == 'refs/heads/main' && vars.AWS_OIDC_ROLE_ARN != ''
+        run: |
+          REG="${{ steps.ecr.outputs.registry }}"
+          REMOTE="${REG}/crucibix/${{ inputs.service }}:${{ github.sha }}"
+          docker tag crucibix/${{ inputs.service }}:${{ github.sha }} "$REMOTE"
+          docker push "$REMOTE"
+          echo "pushed $REMOTE"
+
+  # 7. Mutation (nightly only): mutmut on the domain core — guards assertion-free tests. ─────────
+  mutation:
+    if: inputs.mode == 'full'
+    runs-on: ubuntu-latest
+    needs: [test]
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-python@v6
+        with: { python-version: "${{ inputs.python-version }}" }
+      - run: pip install -U pip && pip install -e ".[dev]" mutmut
+      - name: Mutation testing (domain core)
+        # Non-blocking by nature: nightly signal on test quality. Skip-if-absent when domain-path unset.
+        run: |
+          if [ -z "${{ inputs.domain-path }}" ]; then
+            echo "domain-path not set — skipping mutation (ramp)"; exit 0
+          fi
+          mutmut run --paths-to-mutate "${{ inputs.domain-path }}" || true
+          mutmut results || true
