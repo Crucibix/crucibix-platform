@@ -1,0 +1,21 @@
+# Reference CI workflow for a crucibix-<context> service.
+# Copy into the service repo as .github/workflows/ci.yml and set `service:` to the context name.
+#
+# No top-level `permissions:` block is needed. The org default workflow token is read/write, which —
+# together with the per-job `permissions:` the reusable workflow already declares for its OIDC
+# container build and (public-repo-only) CodeQL jobs — covers the whole Definition-of-Done gate.
+# Verified: a caller with no block passes `build` (AWS OIDC) and `ci-green`. Do NOT re-add a
+# caller-level permissions block — keep token scope defined in one place.
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  ci:
+    uses: Crucibix/crucibix-platform/.github/workflows/python-service.yml@main
+    with:
+      service: <context>   # e.g. identity, finance, support — the bounded-context name
+    secrets: inherit
