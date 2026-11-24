@@ -43,7 +43,13 @@ jobs:
 That runs lint (ruff), type-check (mypy --strict), SAST + dependency + secret scans, unit +
 integration + acceptance tests with coverage (Postgres service container + Alembic migrate),
 contract verification, and a Trivy-scanned container build. `templates/Dockerfile` is the
-reference image.
+reference image and `templates/ci.yml` is the reference caller workflow — copy it to
+`.github/workflows/ci.yml` and set `service:`.
+
+> No caller-level `permissions:` block is required: the org default workflow token is read/write,
+> which (with the per-job scopes the reusable declares for OIDC build + CodeQL) covers the whole
+> gate. CodeQL is gated to public repos (GHAS is unavailable on private/Free), so private service
+> runs skip it and go fully green.
 
 ## Tenant isolation (the RLS replacement)
 
